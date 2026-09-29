@@ -86,6 +86,18 @@ def health():
     return jsonify({"status": "healthy"})
 
 
+@app.get("/outbound-ip")
+def outbound_ip():
+    try:
+        ip = requests.get("https://api.ipify.org?format=json", timeout=10).json()["ip"]
+        return jsonify({"outbound_ip": ip})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+BASE_URL = os.environ.get("BINANCE_BASE_URL", "https://demo-fapi.binance.com").rstrip("/")
+
+
 BASE_URL = os.environ.get("BINANCE_BASE_URL", "https://demo-fapi.binance.com").rstrip("/")
 API_KEY = os.environ.get("BINANCE_DEMO_API_KEY", "")
 API_SECRET = os.environ.get("BINANCE_DEMO_API_SECRET", "")
