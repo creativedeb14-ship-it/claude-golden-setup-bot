@@ -90,6 +90,16 @@ BASE_URL = os.environ.get("BINANCE_BASE_URL", "https://demo-fapi.binance.com").r
 API_KEY = os.environ.get("BINANCE_DEMO_API_KEY", "")
 API_SECRET = os.environ.get("BINANCE_DEMO_API_SECRET", "")
 
+# Optional Delta Exchange India DEMO mirror. It is intentionally separate from
+# the Binance strategy/state engine: the same entry signal is mirrored to Delta
+# without changing the strategy rules.
+DELTA_ENABLED = os.environ.get("DELTA_ENABLED", "0") == "1"
+DELTA_BASE_URL = os.environ.get("DELTA_DEMO_BASE_URL", "https://cdn-ind.testnet.deltaex.org").rstrip("/")
+DELTA_API_KEY = os.environ.get("DELTA_DEMO_API_KEY", "")
+DELTA_API_SECRET = os.environ.get("DELTA_DEMO_API_SECRET", "")
+DELTA_SYMBOLS = {"BTC": "BTCUSD", "ETH": "ETHUSD"}
+DELTA_PRODUCTS = {}
+
 session = requests.Session()
 session.headers.update({
     "X-MBX-APIKEY": API_KEY,
@@ -299,6 +309,254 @@ def get_order_status(symbol: str, client_order_id: str):
     }, signed=True)
 
 
+def _delta_signature(method: str, path: str, query_string: str, body: str, timestamp: str) -> str:
+    message = method.upper() + timestamp + path + query_string + body
+    return hmac.new(
+        DELTA_API_SECRET.encode("utf-8"),
+        message.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def _delta_request(method: str, path: str, params=None, body=None, signed=False):
+    params = params or {}
+    body = body or {}
+    query_string = urlencode(params)
+    body_text = json.dumps(body, separators=(",", ":")) if body else ""
+    url = DELTA_BASE_URL + path
+    if query_string:
+        url += "?" + query_string
+
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "python-algo-bot-render/2.0",
+    }
+    if body_text:
+        headers["Content-Type"] = "application/json"
+    if signed:
+        if not DELTA_API_KEY or not DELTA_API_SECRET:
+            logging.error("[DELTA] API credentials are missing.")
+            return None
+        timestamp = str(int(time.time()))
+        headers.update({
+            "api-key": DELTA_API_KEY,
+            "signature": _delta_signature(method, path, query_string, body_text, timestamp),
+            "timestamp": timestamp,
+        })
+
+    try:
+        resp = session.request(
+            method.upper(), url, headers=headers,
+            data=body_text if body_text else None, timeout=HTTP_TIMEOUT
+        )
+        try:
+            data = resp.json()
+        except ValueError:
+            data = None
+        if 200 <= resp.status_code < 300 and isinstance(data, dict) and data.get("success", True):
+            return data.get("result", data)
+        logging.error("[DELTA API ERROR] %s %s HTTP=%s -> %s", method, path, resp.status_code, data)
+    except requests.RequestException as exc:
+        logging.error("[DELTA NETWORK ERROR] %s %s -> %s", method, path, exc)
+    except Exception as exc:
+        logging.exception("[DELTA REQUEST ERROR] %s %s -> %s", method, path, exc)
+    return None
+
+
+def delta_init_products():
+    if not DELTA_ENABLED:
+        return False
+    if not DELTA_API_KEY or not DELTA_API_SECRET:
+        logging.error("[DELTA] DELTA_ENABLED=1 but DELTA_DEMO_API_KEY/DELTA_DEMO_API_SECRET are missing.")
+        return False
+    ok = True
+    for sym_name, symbol in DELTA_SYMBOLS.items():
+        product = _delta_request("GET", f"/v2/products/{symbol}")
+        if not product or not product.get("id"):
+            logging.error("[DELTA] Product lookup failed for %s (%s).", sym_name, symbol)
+            ok = False
+            continue
+        DELTA_PRODUCTS[sym_name] = product
+        logging.info(
+            "[DELTA INIT] %s product_id=%s contract_value=%s tick_size=%s",
+            sym_name, product.get("id"), product.get("contract_value"), product.get("tick_size")
+        )
+    return ok
+
+
+def get_delta_mark_price(sym_name: str):
+    symbol = DELTA_SYMBOLS[sym_name]
+    data = _delta_request("GET", f"/v2/tickers/{symbol}")
+    if not data:
+        return None
+    try:
+        return float(data.get("mark_price") or data.get("close"))
+    except (TypeError, ValueError):
+        return None
+
+
+def get_delta_last_closed_candle_close(sym_name: str):
+    symbol = DELTA_SYMBOLS[sym_name]
+    now = int(time.time())
+    # Fetch a small 5m range; the latest completed candle is the one before the
+    # currently forming candle.
+    data = _delta_request("GET", "/v2/history/candles", {
+        "resolution": "5m",
+        "symbol": symbol,
+        "start": now - 900,
+        "end": now,
+    })
+    if not data or len(data) < 2:
+        return None
+    try:
+        rows = sorted(data, key=lambda x: x.get("time", 0))
+        return float(rows[-2]["close"])
+    except (TypeError, ValueError, KeyError, IndexError):
+        return None
+
+
+def delta_contract_qty(sym_name: str, price: float):
+    product = DELTA_PRODUCTS.get(sym_name) or {}
+    try:
+        contract_value = float(product.get("contract_value"))
+        if contract_value <= 0 or price <= 0:
+            return 0
+        target_notional = CAPITAL * POSITION_PCT
+        # Delta orders use integer contract sizes. The minimum executable size
+        # can therefore be larger than the strategy's $5 reference notional.
+        qty = max(1, math.ceil(target_notional / (price * contract_value)))
+        actual_notional = qty * price * contract_value
+        logging.info(
+            "[DELTA SIZE] %s target_notional=$%.2f -> %s contract(s), approx notional=$%.2f",
+            sym_name, target_notional, qty, actual_notional
+        )
+        return int(qty)
+    except (TypeError, ValueError):
+        return 0
+
+
+def delta_place_market(sym_name: str, side: str, qty: int, client_order_id: str):
+    product = DELTA_PRODUCTS.get(sym_name)
+    if not product or qty <= 0:
+        return None
+    payload = {
+        "product_id": int(product["id"]),
+        "size": int(qty),
+        "side": "buy" if side == "BUY" else "sell",
+        "order_type": "market_order",
+        "time_in_force": "ioc",
+        "reduce_only": False,
+        "client_order_id": client_order_id[:32],
+    }
+    result = _delta_request("POST", "/v2/orders", body=payload, signed=True)
+    if result and result.get("id"):
+        logging.info("[DELTA ENTRY] %s %s qty=%s order_id=%s state=%s", sym_name, side, qty, result.get("id"), result.get("state"))
+        return result
+    logging.error("[DELTA ENTRY FAILED] %s %s qty=%s", sym_name, side, qty)
+    return None
+
+
+def delta_place_stop(sym_name: str, side: str, qty: int, stop_price: float, client_order_id: str):
+    product = DELTA_PRODUCTS.get(sym_name)
+    if not product or qty <= 0:
+        return None
+    payload = {
+        "product_id": int(product["id"]),
+        "size": int(qty),
+        "side": "buy" if side == "BUY" else "sell",
+        "order_type": "market_order",
+        "stop_order_type": "stop_loss_order",
+        "stop_price": str(stop_price),
+        "stop_trigger_method": "last_traded_price",
+        "time_in_force": "gtc",
+        "reduce_only": True,
+        "client_order_id": client_order_id[:32],
+    }
+    result = _delta_request("POST", "/v2/orders", body=payload, signed=True)
+    if result and result.get("id"):
+        logging.info("[DELTA SL] %s %s qty=%s stop=%s order_id=%s state=%s", sym_name, side, qty, stop_price, result.get("id"), result.get("state"))
+        return result
+    logging.error("[DELTA SL FAILED] %s %s qty=%s stop=%s", sym_name, side, qty, stop_price)
+    return None
+
+
+def delta_cancel_order(sym_name: str, order_id=None, client_order_id=None):
+    product = DELTA_PRODUCTS.get(sym_name)
+    if not product or (not order_id and not client_order_id):
+        return None
+    payload = {"product_id": int(product["id"])}
+    if order_id:
+        payload["id"] = int(order_id)
+    else:
+        payload["client_order_id"] = client_order_id[:32]
+    return _delta_request("DELETE", "/v2/orders", body=payload, signed=True)
+
+
+def delta_order_status(sym_name: str, order_id=None, client_order_id=None):
+    product = DELTA_PRODUCTS.get(sym_name)
+    if not product:
+        return None
+    params = {"product_ids": str(product["id"]), "page_size": 50}
+    if client_order_id:
+        params["client_order_id"] = client_order_id
+    result = _delta_request("GET", "/v2/orders", params=params, signed=True)
+    if isinstance(result, list):
+        for order in result:
+            if order_id and int(order.get("id", -1)) == int(order_id):
+                return order
+            if client_order_id and order.get("client_order_id") == client_order_id:
+                return order
+    return None
+
+
+def delta_mirror_entry(sym_name: str, side: str, entry_price: float):
+    if not DELTA_ENABLED:
+        return None
+    qty = delta_contract_qty(sym_name, entry_price)
+    if qty <= 0:
+        return None
+    order_side = "BUY" if side == "LONG" else "SELL"
+    cid = f"D{sym_name[:1]}E{int(time.time()*1000)}"
+    result = delta_place_market(sym_name, order_side, qty, cid)
+    if not result:
+        return None
+    actual_entry = entry_price
+    try:
+        actual_entry = float(result.get("average_fill_price") or entry_price)
+    except (TypeError, ValueError):
+        pass
+    close_side = "SELL" if side == "LONG" else "BUY"
+    # Delta's contract size is integer-based. With the $5 reference notional,
+    # most symbols will have fewer than 5 contracts, so an exact 80/20 split
+    # is not always representable. We therefore protect the mirrored Delta
+    # position with its executable whole-contract quantity. Binance remains the
+    # exact strategy/state engine.
+    sl = actual_entry - CONFIG[sym_name]["max_sl"] if side == "LONG" else actual_entry + CONFIG[sym_name]["max_sl"]
+    sl_cid = f"D{sym_name[:1]}S{int(time.time()*1000)}"
+    sl_result = delta_place_stop(sym_name, close_side, qty, sl, sl_cid)
+    if not sl_result:
+        logging.error("[DELTA] Entry succeeded but initial SL failed; closing Delta mirror position for safety.")
+        delta_place_market(sym_name, close_side, qty, f"D{sym_name[:1]}X{int(time.time()*1000)}")
+        return {"failed": True}
+    return {"qty": qty, "entry": actual_entry, "sl": sl, "sl_id": sl_result.get("id"), "sl_client_id": sl_cid, "side": side}
+
+
+def delta_replace_sl(sym_name: str, mirror: dict, new_sl: float):
+    if not DELTA_ENABLED or not mirror:
+        return False
+    if mirror.get("sl_id"):
+        delta_cancel_order(sym_name, order_id=mirror["sl_id"])
+    close_side = "SELL" if mirror["side"] == "LONG" else "BUY"
+    cid = f"D{sym_name[:1]}S{int(time.time()*1000)}"
+    result = delta_place_stop(sym_name, close_side, int(mirror["qty"]), new_sl, cid)
+    if not result:
+        return False
+    mirror["sl"] = new_sl
+    mirror["sl_id"] = result.get("id")
+    mirror["sl_client_id"] = cid
+    return True
+
+
 def load_state():
     default = {
         "date": today_ist(),
@@ -453,6 +711,12 @@ def open_new_position(sym_name, cfg, side, entry_price, precision, min_notional)
         place_market_order(cfg["symbol"], close_side, qty, f"{sym_name}_safety_close_{ts}")
         return None
 
+    delta_mirror = None
+    if DELTA_ENABLED:
+        delta_mirror = delta_mirror_entry(sym_name, side, actual_entry)
+        if delta_mirror and delta_mirror.get("failed"):
+            delta_mirror = None
+
     position = {
         "side": side,
         "entry": actual_entry,
@@ -464,6 +728,7 @@ def open_new_position(sym_name, cfg, side, entry_price, precision, min_notional)
         "sl_client_id": sl_client_id,
         "sl_qty": partial_qty,
         "runner_qty": runner_qty,
+        "delta": delta_mirror,
     }
     logging.info(
         "[ENTRY] %s %s @ %.4f qty=%s initial_sl=%.4f protective_sl_qty=%s runner_qty=%s",
@@ -493,6 +758,9 @@ def replace_protective_sl(sym_name, cfg, position, new_sl):
 
     position["sl"] = new_sl
     position["sl_client_id"] = new_id
+    if DELTA_ENABLED and position.get("delta"):
+        if not delta_replace_sl(sym_name, position["delta"], new_sl):
+            logging.error("[%s] Delta mirror SL update failed; Binance SL update remains active.", sym_name)
     return True
 
 
@@ -609,6 +877,10 @@ def main():
         logging.error("BINANCE_DEMO_API_KEY / BINANCE_DEMO_API_SECRET environment variables are missing. Bot stopped.")
         return
 
+    delta_ok = delta_init_products() if DELTA_ENABLED else False
+    if DELTA_ENABLED and not delta_ok:
+        logging.error("[DELTA] Delta mirror initialization failed. Binance will continue; Delta mirror is disabled for this process.")
+
     precisions = {}
     min_notionals = {}
     for sym_name, cfg in CONFIG.items():
@@ -623,9 +895,10 @@ def main():
     state = reset_if_new_day(load_state())
     save_state(state)
     last_heartbeat = 0
-    logging.info("=== ALGO BOT STARTED (Binance Futures DEMO) ===")
+    logging.info("=== ALGO BOT STARTED (Binance Futures DEMO + optional Delta DEMO mirror) ===")
     logging.info("[TIME] Strategy session timezone: Asia/Kolkata")
-    logging.info("[CONFIG] Base URL: %s", BASE_URL)
+    logging.info("[CONFIG] Binance Base URL: %s", BASE_URL)
+    logging.info("[CONFIG] Delta mirror: %s", "ENABLED" if (DELTA_ENABLED and delta_ok) else "DISABLED")
 
     while True:
         try:
@@ -702,6 +975,9 @@ def main():
                     pos = state["positions"].get(sym_name)
                     if pos:
                         pos_str = f"OPEN({pos['side']}, qty={pos['qty']}, sl={pos['sl']})"
+                        dpos = pos.get("delta")
+                        if dpos:
+                            pos_str += f" DELTA(qty={dpos.get('qty')}, sl={dpos.get('sl')})"
                     else:
                         pos_str = "FLAT"
                     status_parts.append(f"{sym_name}={price} [{pos_str}]")
