@@ -882,6 +882,58 @@ def setup_logging():
     )
 
 
+def verify_binance_connection():
+    """Read-only Binance credential/API verification. Never places an order."""
+    if not API_KEY or not API_SECRET:
+        return {"status": "MISSING_CREDENTIALS"}
+    data = _request("GET", "/fapi/v2/account", signed=True)
+    if isinstance(data, dict) and "accountAlias" in data:
+        return {"status": "CONNECTED"}
+    return {"status": "FAILED"}
+
+
+def verify_delta_connection():
+    """Read-only Delta Demo credential/API verification. Never places an order."""
+    if not DELTA_ENABLED:
+        return {"status": "DISABLED"}
+    if not DELTA_API_KEY or not DELTA_API_SECRET:
+        return {"status": "MISSING_CREDENTIALS"}
+
+    # First verify both products are reachable on the Demo endpoint.
+    products_ok = True
+    product_ids = {}
+    for sym_name, symbol in DELTA_SYMBOLS.items():
+        product = _delta_request("GET", f"/v2/products/{symbol}")
+        if not product or not product.get("id"):
+            products_ok = False
+        else:
+            product_ids[sym_name] = product.get("id")
+
+    # Then make one signed, read-only account request. This tests API key,
+    # secret, timestamp/signature and the Trusted IP restriction without trading.
+    wallet = _delta_request("GET", "/v2/wallet/balances", signed=True)
+    auth_ok = wallet is not None
+
+    if products_ok and auth_ok:
+        return {"status": "CONNECTED", "products": product_ids}
+    if not products_ok and auth_ok:
+        return {"status": "AUTH_OK_PRODUCT_LOOKUP_FAILED"}
+    if products_ok and not auth_ok:
+        return {"status": "AUTH_FAILED"}
+    return {"status": "FAILED"}
+
+
+@app.get("/verify")
+def verify():
+    """Read-only deployment/API verification. Does NOT place or cancel orders."""
+    return jsonify({
+        "service": "ok",
+        "binance": verify_binance_connection(),
+        "delta": verify_delta_connection(),
+        "note": "READ_ONLY: no trade/order is created or cancelled by this endpoint."
+    })
+
+
 def main():
     setup_logging()
 
