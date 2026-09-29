@@ -1,5 +1,5 @@
 services:
-  - type: worker
+  - type: web service configuration
     name: binance-demo-algo-bot
     runtime: python
     buildCommand: pip install -r requirements.txt
