@@ -5,23 +5,17 @@ from flask import Flask, jsonify
 import ccxt
 
 # ==============================================================================
-# CONFIGURATION & AUTO-STRIP
+# SMART ENVIRONMENT VARIABLE RESOLVER
 # ==============================================================================
-raw_key = (
-    os.getenv("DELTA_API_KEY")
-    or os.getenv("DELTA_DEMO_API_KEY")
-    or os.getenv("API_KEY")
-    or ""
-)
-raw_secret = (
-    os.getenv("DELTA_API_SECRET")
-    or os.getenv("DELTA_DEMO_API_SECRET")
-    or os.getenv("API_SECRET")
-    or ""
-)
+def get_clean_env(keys):
+    for k in keys:
+        val = os.getenv(k, "").strip().strip('"').strip("'")
+        if val and not val.startswith("YOUR_"):
+            return val
+    return ""
 
-API_KEY = raw_key.strip().strip('"').strip("'")
-API_SECRET = raw_secret.strip().strip('"').strip("'")
+API_KEY = get_clean_env(["DELTA_API_KEY", "DELTA_DEMO_API_KEY", "API_KEY"])
+API_SECRET = get_clean_env(["DELTA_API_SECRET", "DELTA_DEMO_API_SECRET", "API_SECRET"])
 
 SYMBOL = os.getenv("TRADING_SYMBOL", "BTC/USDT:USDT")
 TIMEFRAME = "1m"
@@ -33,7 +27,8 @@ RRR = 2.0          # 1:2 Target ($2 Profit)
 app = Flask(__name__)
 
 bot_state = {
-    "status": "Starting engine...",
+    "status": "Scanning Delta servers...",
+    "connected_gateway": "Searching...",
     "symbol": "Resolving...",
     "wallet_balance": "Fetching...",
     "last_price": 0.0,
@@ -42,44 +37,72 @@ bot_state = {
     "active_trade": None,
     "total_trades": 0,
     "last_action": "None",
+    "diagnostic_info": {},
     "last_error": None
 }
 
 # ==============================================================================
-# PROPER DELTA TESTNET INITIALIZER (NO FAKE URLS)
+# SMART MULTI-SERVER & SWAP DETECTOR (INDIA + GLOBAL TESTNET)
 # ==============================================================================
-def create_delta_exchange():
-    # Attempt 1: Official CCXT Delta Sandbox
-    try:
-        ex = ccxt.delta({
-            "apiKey": API_KEY,
-            "secret": API_SECRET,
-            "enableRateLimit": True,
-            "options": {"defaultType": "swap"}
-        })
-        ex.set_sandbox_mode(True)
-        ex.load_markets()
-        return ex
-    except Exception:
-        pass
+def smart_delta_connect():
+    global bot_state
+    
+    candidate_urls = [
+        ("Delta India Dedicated", "https://api.india.delta.exchange"),
+        ("Delta Testnet Global", "https://testnet-api.delta.exchange"),
+        ("Delta Mainnet/Demo", "https://api.delta.exchange")
+    ]
+    
+    credential_combos = [
+        ("Normal", API_KEY, API_SECRET),
+        ("Swapped", API_SECRET, API_KEY)
+    ]
+    
+    diagnostic_log = {}
 
-    # Attempt 2: Direct Testnet-API Gateway (Verified Working)
-    ex = ccxt.delta({
-        "apiKey": API_KEY,
-        "secret": API_SECRET,
+    for srv_name, base_url in candidate_urls:
+        for combo_name, key, sec in credential_combos:
+            if not key or not sec:
+                continue
+            try:
+                ex = ccxt.delta({
+                    "apiKey": key,
+                    "secret": sec,
+                    "enableRateLimit": True,
+                    "urls": {
+                        "api": {
+                            "public": base_url,
+                            "private": base_url
+                        }
+                    },
+                    "options": {"defaultType": "swap"}
+                })
+                # Test private authenticated endpoint
+                bal = ex.fetch_balance()
+                # If succeeded, we found the right server and right key pairing!
+                diagnostic_log[f"{srv_name} ({combo_name})"] = "SUCCESS"
+                bot_state["diagnostic_info"] = diagnostic_log
+                return ex, f"{srv_name} [{base_url}] ({combo_name})", bal
+            except Exception as e:
+                err_msg = str(e)
+                if "invalid_api_key" in err_msg:
+                    diagnostic_log[f"{srv_name} ({combo_name})"] = "Invalid Key"
+                else:
+                    diagnostic_log[f"{srv_name} ({combo_name})"] = err_msg[:40]
+
+    bot_state["diagnostic_info"] = diagnostic_log
+    
+    # Fallback to testnet
+    fallback = ccxt.delta({
+        "apiKey": API_KEY, "secret": API_SECRET,
         "enableRateLimit": True,
-        "urls": {
-            "api": {
-                "public": "https://testnet-api.delta.exchange",
-                "private": "https://testnet-api.delta.exchange"
-            }
-        },
+        "urls": {"api": {"public": "https://testnet-api.delta.exchange", "private": "https://testnet-api.delta.exchange"}},
         "options": {"defaultType": "swap"}
     })
-    return ex
+    return fallback, "Fallback (Check Diagnostic Info)", None
 
 # ==============================================================================
-# PURE PYTHON EMA (NO PANDAS / NUMPY)
+# PURE PYTHON EMA & BALANCE PARSER
 # ==============================================================================
 def calculate_ema(prices, period):
     if len(prices) < period:
@@ -90,10 +113,12 @@ def calculate_ema(prices, period):
         ema = (price * multiplier) + (ema * (1.0 - multiplier))
     return ema
 
-def fetch_clean_balance(exchange):
+def parse_balance(bal):
+    if not bal:
+        return "$0.00"
     try:
-        bal = exchange.fetch_balance()
-        for asset in ["USDT", "USD", "BTC", "DETO"]:
+        # Check all possible collateral currencies on Delta India / Demo
+        for asset in ["USDT", "USD", "INR", "BTC", "DETO"]:
             if asset in bal and float(bal[asset].get("total", 0) or 0) > 0:
                 t = float(bal[asset]["total"])
                 f = float(bal[asset]["free"])
@@ -103,16 +128,18 @@ def fetch_clean_balance(exchange):
                 return f"{float(v):.4f} {k}"
         return "$0.00 (Demo Funds Empty)"
     except Exception as e:
-        return f"Balance Info: {str(e)}"
+        return f"Error: {e}"
 
 # ==============================================================================
-# 24/7 BACKGROUND BOT WORKER (CLEAN & SILENT)
+# 24/7 BACKGROUND BOT WORKER
 # ==============================================================================
 def bot_worker():
     global bot_state, SYMBOL
     time.sleep(3)
 
-    exchange = create_delta_exchange()
+    exchange, gateway_info, initial_bal = smart_delta_connect()
+    bot_state["connected_gateway"] = gateway_info
+
     contract_size = 1.0
     min_qty = 1.0
     is_inverse = False
@@ -136,18 +163,19 @@ def bot_worker():
             is_inverse = bool(m.get("inverse", False))
             
             bot_state["symbol"] = SYMBOL
-            bot_state["wallet_balance"] = fetch_clean_balance(exchange)
+            bal = initial_bal if initial_bal else exchange.fetch_balance()
+            bot_state["wallet_balance"] = parse_balance(bal)
             bot_state["status"] = "Active & Monitoring 1m Candles"
             bot_state["last_error"] = None
-            print(f"✅ Bot Online | Symbol: {SYMBOL} | Balance: {bot_state['wallet_balance']}")
+            print(f"✅ Bot Online | Gateway: {gateway_info} | Symbol: {SYMBOL} | Balance: {bot_state['wallet_balance']}")
         else:
-            bot_state["last_error"] = "Market symbol BTC not found"
+            bot_state["last_error"] = "BTC market symbol not found"
             print("❌ BTC market symbol not found on Delta")
             return
 
     except Exception as e:
         bot_state["last_error"] = str(e)
-        print(f"❌ Market Load Error: {e}")
+        print(f"❌ Market Setup Error: {e}")
         return
 
     active_trade = None
@@ -156,7 +184,6 @@ def bot_worker():
 
     while True:
         try:
-            # 1. Fetch 1m candles quietly
             ohlcv = exchange.fetch_ohlcv(SYMBOL, timeframe=TIMEFRAME, limit=35)
             if not ohlcv or len(ohlcv) < 20:
                 time.sleep(2)
@@ -171,13 +198,17 @@ def bot_worker():
             bot_state["fast_ema_9"] = round(fast_ema, 2)
             bot_state["slow_ema_15"] = round(slow_ema, 2)
 
-            # Update wallet quietly every 3 mins
+            # Update wallet balance quietly every 3 mins
             if time.time() - balance_timer > 180:
-                bot_state["wallet_balance"] = fetch_clean_balance(exchange)
+                try:
+                    b = exchange.fetch_balance()
+                    bot_state["wallet_balance"] = parse_balance(b)
+                except:
+                    pass
                 balance_timer = time.time()
 
             # -------------------------------------------------------------
-            # A) ACTIVE TRADE MANAGEMENT (SL / TP)
+            # A) ACTIVE TRADE MANAGEMENT (SL / TP CHECK)
             # -------------------------------------------------------------
             if active_trade is not None:
                 side = active_trade["side"]
@@ -192,14 +223,12 @@ def bot_worker():
                         print(f"🛑 [BUY SL HIT] Closed @ {curr_price} | PnL: -$1.00")
                         active_trade = None
                         bot_state["active_trade"] = None
-                        bot_state["wallet_balance"] = fetch_clean_balance(exchange)
                     elif curr_price >= tp:
                         exchange.create_order(SYMBOL, "market", "sell", qty, params={"reduceOnly": True})
                         bot_state["last_action"] = f"BUY TP Hit (+$2.00) @ {curr_price}"
                         print(f"🎯 [BUY TP HIT] Closed @ {curr_price} | PnL: +$2.00")
                         active_trade = None
                         bot_state["active_trade"] = None
-                        bot_state["wallet_balance"] = fetch_clean_balance(exchange)
 
                 elif side == "SELL":
                     if curr_price >= sl:
@@ -208,14 +237,12 @@ def bot_worker():
                         print(f"🛑 [SELL SL HIT] Closed @ {curr_price} | PnL: -$1.00")
                         active_trade = None
                         bot_state["active_trade"] = None
-                        bot_state["wallet_balance"] = fetch_clean_balance(exchange)
                     elif curr_price <= tp:
                         exchange.create_order(SYMBOL, "market", "buy", qty, params={"reduceOnly": True})
                         bot_state["last_action"] = f"SELL TP Hit (+$2.00) @ {curr_price}"
                         print(f"🎯 [SELL TP HIT] Closed @ {curr_price} | PnL: +$2.00")
                         active_trade = None
                         bot_state["active_trade"] = None
-                        bot_state["wallet_balance"] = fetch_clean_balance(exchange)
 
             # -------------------------------------------------------------
             # B) SIGNAL DETECTION ON LATEST CLOSED 1M CANDLE
@@ -281,20 +308,26 @@ def bot_worker():
 
         time.sleep(3)
 
-# Start background thread
+# Background Thread Start
 worker = threading.Thread(target=bot_worker, daemon=True)
 worker.start()
 
-# Web Health Status
+# Status API
 @app.route("/")
 @app.route("/status")
 def status():
     return jsonify({
         "status": "ONLINE 24/7",
-        "bot": bot_state
+        "bot": bot_state,
+        "key_preview": {
+            "key_loaded": f"{API_KEY[:4]}...{API_KEY[-4:]}" if len(API_KEY) >= 8 else "MISSING/SHORT",
+            "key_length": len(API_KEY),
+            "secret_loaded": f"{API_SECRET[:4]}...{API_SECRET[-4:]}" if len(API_SECRET) >= 8 else "MISSING/SHORT",
+            "secret_length": len(API_SECRET)
+        }
     }), 200
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
-                        
+            
