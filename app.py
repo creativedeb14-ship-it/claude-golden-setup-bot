@@ -7,8 +7,8 @@ import ccxt
 # ==============================================================================
 # CONFIGURATION
 # ==============================================================================
-API_KEY = os.getenv("DELTA_API_KEY", "")
-API_SECRET = os.getenv("DELTA_API_SECRET", "")
+API_KEY = os.getenv("DELTA_API_KEY") or os.getenv("DELTA_DEMO_API_KEY")
+API_SECRET = os.getenv("DELTA_API_SECRET") or os.getenv("DELTA_DEMO_API_SECRET")
 SYMBOL = os.getenv("TRADING_SYMBOL", "BTC/USD:BTC")
 TIMEFRAME = "1m"
 
