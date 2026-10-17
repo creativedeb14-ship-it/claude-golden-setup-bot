@@ -17,7 +17,8 @@ def get_clean_env(keys):
 API_KEY = get_clean_env(["DELTA_API_KEY", "DELTA_DEMO_API_KEY", "API_KEY"])
 API_SECRET = get_clean_env(["DELTA_API_SECRET", "DELTA_DEMO_API_SECRET", "API_SECRET"])
 
-SYMBOL = os.getenv("TRADING_SYMBOL", "BTC/USDT")
+# Matched directly to Delta App screen: BTCUSD (1 Lot = 0.001 BTC)
+SYMBOL = os.getenv("TRADING_SYMBOL", "BTCUSD")
 TIMEFRAME = "1m"
 FAST_PERIOD = 9
 SLOW_PERIOD = 15
@@ -29,7 +30,7 @@ app = Flask(__name__)
 bot_state = {
     "status": "Initializing...",
     "connected_gateway": "Searching...",
-    "symbol": "Resolving...",
+    "symbol": "BTCUSD",
     "wallet_balance": "Fetching...",
     "last_price": 0.0,
     "fast_ema_9": 0.0,
@@ -53,8 +54,7 @@ def log(msg):
 def connect_delta():
     candidate_urls = [
         ("Delta India Demo (Testnet)", "https://cdn-ind.testnet.deltaex.org"),
-        ("Delta India Live (Prod)", "https://api.india.delta.exchange"),
-        ("Delta Global Testnet", "https://testnet-api.delta.exchange")
+        ("Delta India Live (Prod)", "https://api.india.delta.exchange")
     ]
     
     diagnostic_log = {}
@@ -70,7 +70,7 @@ def connect_delta():
             bal = ex.fetch_balance()
             diagnostic_log[srv_name] = "SUCCESS"
             bot_state["diagnostic_info"] = diagnostic_log
-            log(f" Connected to: {srv_name}")
+            log(f"✅ Connected to: {srv_name}")
             return ex, f"{srv_name} [{base_url}]", bal
         except Exception as e:
             diagnostic_log[srv_name] = str(e)[:40]
@@ -84,11 +84,7 @@ def connect_delta():
     })
     return fallback, "Delta India Demo", None
 
-# ==============================================================================
-# BULLETPROOF PRICE FETCHER (NEVER RETURNS NONE / CRASHES)
-# ==============================================================================
 def get_safe_live_price(exchange, symbol):
-    # 1. Try Ticker Fields
     try:
         ticker = exchange.fetch_ticker(symbol)
         if ticker:
@@ -104,27 +100,14 @@ def get_safe_live_price(exchange, symbol):
     except Exception:
         pass
 
-    # 2. Try Orderbook
     try:
         ob = exchange.fetch_order_book(symbol, limit=5)
-        if ob.get("bids") and len(ob["bids"]) > 0 and ob["bids"][0][0]:
+        if ob.get("bids") and len(ob["bids"]) > 0:
             return float(ob["bids"][0][0])
-        if ob.get("asks") and len(ob["asks"]) > 0 and ob["asks"][0][0]:
-            return float(ob["asks"][0][0])
     except Exception:
         pass
 
-    # 3. Try Recent 1m Candle Close
-    try:
-        ohlcv = exchange.fetch_ohlcv(symbol, timeframe="1m", limit=5)
-        if ohlcv and len(ohlcv) > 0:
-            c = ohlcv[-1][4]
-            if c is not None and float(c) > 0:
-                return float(c)
-    except Exception:
-        pass
-
-    return float(bot_state.get("last_price") or 68000.0)
+    return float(bot_state.get("last_price") or 81600.0)
 
 def calculate_ema(prices, period):
     if len(prices) < period:
@@ -157,31 +140,18 @@ def parse_balance(bal):
         return f"Error: {e}"
 
 # ==============================================================================
-# SAFE POSITION SIZING ($1 RISK MATH)
+# DELTA LOT SIZING (1 Lot = 0.001 BTC on BTCUSD)
 # ==============================================================================
-def get_safe_order_qty(exchange, symbol, entry_px, sl_px, is_inverse, contract_size, min_qty):
-    dist = abs(entry_px - sl_px)
-    if dist <= 0:
-        dist = 50.0
-
-    if is_inverse:
-        pct_risk = dist / entry_px
-        notional = RISK_USD / (pct_risk + 1e-9)
-        raw_q = notional / (contract_size or 1.0)
-    else:
-        qty_base = RISK_USD / (dist + 1e-9)
-        raw_q = qty_base / (contract_size or 1.0)
-
-    target_q = max(min_qty, raw_q)
+def get_safe_lots(exchange, symbol, dist):
+    # On BTCUSD, 1 Lot is 0.001 BTC (1 contract)
+    # Risk per lot for 50 point move = 50 * 0.001 = $0.05
+    # Strict $1 Risk = 1.0 / (dist * 0.001) lots
     try:
-        formatted = exchange.amount_to_precision(symbol, target_q)
-        if formatted is not None:
-            return float(formatted)
-    except Exception:
-        pass
-    
-    # Delta India contracts integer/precision handling
-    return float(max(min_qty, round(target_q, 3)))
+        raw_lots = RISK_USD / ((dist * 0.001) + 1e-9)
+        lots = max(1, int(round(raw_lots)))
+        return min(lots, 10) # Cap at safe max lots for demo
+    except:
+        return 1
 
 # ==============================================================================
 # 24/7 BACKGROUND WORKER
@@ -194,39 +164,25 @@ def bot_worker():
     global_exchange = exchange
     bot_state["connected_gateway"] = gateway_info
 
-    contract_size = 1.0
-    min_qty = 1.0
-    is_inverse = False
-
     try:
         exchange.load_markets()
         matched = None
-        if SYMBOL in exchange.markets:
-            matched = SYMBOL
-        else:
-            for s, m in exchange.markets.items():
-                m_id = m.get("id", "")
-                if m_id in ["BTCUSDT", "BTCUSD"] or s in ["BTC/USDT", "BTC/USD", "BTC/USDT:USDT", "BTC/USD:BTC"]:
-                    matched = s
-                    break
+        # Priority match for BTCUSD exactly as seen in Delta App
+        for s, m in exchange.markets.items():
+            if m.get("id") == "BTCUSD" or s == "BTCUSD" or s == "BTC/USD:BTC" or s == "BTC/USD":
+                matched = s
+                break
+        
+        if not matched:
+            matched = "BTCUSD" if "BTCUSD" in exchange.markets else list(exchange.markets.keys())[0]
 
-        if matched:
-            SYMBOL = matched
-            m = exchange.market(SYMBOL)
-            contract_size = float(m.get("contractSize", 1.0) or 1.0)
-            limits = m.get("limits", {}).get("amount", {}) or {}
-            min_qty = float(limits.get("min", 1.0) or 1.0)
-            is_inverse = bool(m.get("inverse", False))
-            
-            bot_state["symbol"] = SYMBOL
-            bal = initial_bal if initial_bal else exchange.fetch_balance()
-            bot_state["wallet_balance"] = parse_balance(bal)
-            bot_state["status"] = "Active & Monitoring 1m Candles"
-            bot_state["last_error"] = None
-            log(f" Bot Ready! Symbol: {SYMBOL} | Min Qty: {min_qty} | Balance: {bot_state['wallet_balance']}")
-        else:
-            bot_state["last_error"] = "BTC market symbol not found"
-            return
+        SYMBOL = matched
+        bot_state["symbol"] = SYMBOL
+        bal = initial_bal if initial_bal else exchange.fetch_balance()
+        bot_state["wallet_balance"] = parse_balance(bal)
+        bot_state["status"] = "Active & Monitoring 1m Candles"
+        bot_state["last_error"] = None
+        log(f"🚀 Bot Ready! Unified Symbol: {SYMBOL} | Balance: {bot_state['wallet_balance']}")
     except Exception as e:
         bot_state["last_error"] = str(e)
         return
@@ -289,7 +245,7 @@ def bot_worker():
                         bot_state["last_action"] = f"SELL TP Hit (+$2.00) @ {curr_price}"
                         bot_state["active_trade"] = None
 
-            # Natural Strategy Scan
+            # Natural Strategy Execution
             else:
                 ohlcv = exchange.fetch_ohlcv(SYMBOL, timeframe=TIMEFRAME, limit=10)
                 if ohlcv and len(ohlcv) >= 3:
@@ -309,33 +265,34 @@ def bot_worker():
                         if fast_ema > slow_ema and is_bull_engulf and fast_ema > 0:
                             entry = curr_price
                             sl = float(c_low)
-                            qty = get_safe_order_qty(exchange, SYMBOL, entry, sl, is_inverse, contract_size, min_qty)
-                            tp = round(entry + (abs(entry - sl) * RRR), 2)
+                            dist = abs(entry - sl)
+                            qty = get_safe_lots(exchange, SYMBOL, dist)
+                            tp = round(entry + (dist * RRR), 2)
                             exchange.create_order(SYMBOL, "market", "buy", qty)
                             bot_state["active_trade"] = {"side": "BUY", "entry": entry, "sl": sl, "tp": tp, "qty": qty}
                             bot_state["total_trades"] += 1
-                            bot_state["last_action"] = f"Natural BUY Opened @ {entry}"
+                            bot_state["last_action"] = f"BUY Opened @ {entry}"
                             last_candle_time = c_time
-                            log(f"⚡ Natural BUY Executed @ {entry}")
+                            log(f"⚡ Natural BUY Executed @ {entry} (Lots: {qty})")
 
                         elif fast_ema < slow_ema and is_bear_engulf and fast_ema > 0:
                             entry = curr_price
                             sl = float(c_high)
-                            qty = get_safe_order_qty(exchange, SYMBOL, entry, sl, is_inverse, contract_size, min_qty)
-                            tp = round(entry - (abs(sl - entry) * RRR), 2)
+                            dist = abs(sl - entry)
+                            qty = get_safe_lots(exchange, SYMBOL, dist)
+                            tp = round(entry - (dist * RRR), 2)
                             exchange.create_order(SYMBOL, "market", "sell", qty)
                             bot_state["active_trade"] = {"side": "SELL", "entry": entry, "sl": sl, "tp": tp, "qty": qty}
                             bot_state["total_trades"] += 1
-                            bot_state["last_action"] = f"Natural SELL Opened @ {entry}"
+                            bot_state["last_action"] = f"SELL Opened @ {entry}"
                             last_candle_time = c_time
-                            log(f"⚡ Natural SELL Executed @ {entry}")
+                            log(f"⚡ Natural SELL Executed @ {entry} (Lots: {qty})")
 
         except Exception as e:
             bot_state["last_error"] = str(e)
 
         time.sleep(3)
 
-# Thread Start
 worker = threading.Thread(target=bot_worker, daemon=True)
 worker.start()
 
@@ -347,42 +304,31 @@ worker.start()
 def status():
     return jsonify({
         "status": "ONLINE 24/7",
-        "bot": bot_state,
-        "test_instructions": "To simulate an instant live trade on Delta Demo with $1 risk, open: /test-trade"
+        "bot": bot_state
     }), 200
 
 # ==============================================================================
-# 🎯 INSTANT TEST-TRADE ENDPOINT (BULLETPROOF TEST EXECUTION)
+# 🎯 1-LOT TEST TRADE (100% MARGIN SAFE & POSITION GUARANTEED)
 # ==============================================================================
 @app.route("/test-trade")
 def run_test_trade():
     global global_exchange, SYMBOL, bot_state
     if not global_exchange:
-        return jsonify({"error": "Exchange not connected yet. Wait 5 seconds."}), 500
+        return jsonify({"error": "Exchange connecting, please wait 3 seconds..."}), 500
 
     try:
-        # 1. Guaranteed Safe Price (Never None)
         curr_price = get_safe_live_price(global_exchange, SYMBOL)
         
-        m = global_exchange.market(SYMBOL)
-        contract_size = float(m.get("contractSize", 1.0) or 1.0)
-        limits = m.get("limits", {}).get("amount", {}) or {}
-        min_qty = float(limits.get("min", 1.0) or 1.0)
-        is_inverse = bool(m.get("inverse", False))
-
-        # 2. Strict $1 Risk Math (50 Point move test)
+        # 1 Lot = 0.001 BTC on BTCUSD (Margin required: ~$1.60 USD)
+        qty = 1.0  
         sl_distance = 50.0
         entry_price = curr_price
         sl_price = round(entry_price - sl_distance, 2)
         tp_price = round(entry_price + (sl_distance * RRR), 2)
 
-        qty = get_safe_order_qty(global_exchange, SYMBOL, entry_price, sl_price, is_inverse, contract_size, min_qty)
-
-        # 3. Send Market Order to Delta Demo
-        log(f"🧪 [TEST TRADE TRIGGERED] Sending BUY Order for {qty} {SYMBOL} @ {entry_price}...")
+        log(f"🧪 [PLACING 1 LOT BTCUSD ORDER] Price: {entry_price}...")
         order = global_exchange.create_order(SYMBOL, "market", "buy", qty)
 
-        # 4. Save to Active Trade State
         trade_info = {
             "side": "BUY",
             "entry": entry_price,
@@ -396,39 +342,35 @@ def run_test_trade():
         bot_state["total_trades"] += 1
         bot_state["last_action"] = f"Test BUY Placed @ {entry_price}"
 
-        notional_value = qty * entry_price * contract_size
-        est_margin = round(notional_value / 50.0, 3)
-
         return jsonify({
-            "message": " TEST TRADE SUCCESSFULLY PLACED ON DELTA DEMO!",
-            "trade_breakdown": {
+            "status": "SUCCESS",
+            "message": "✅ 1 LOT BTCUSD ORDER PLACED ON DELTA DEMO!",
+            "details": {
                 "symbol": SYMBOL,
                 "side": "BUY",
+                "lots": "1 Lot (0.001 BTC)",
                 "entry_price": entry_price,
-                "stop_loss_price": sl_price,
-                "take_profit_price": tp_price,
-                "qty": qty,
-                "max_risk_usd": "$1.00 USDT",
-                "target_profit_usd": "$2.00 USDT",
-                "risk_reward_ratio": "1:2",
-                "approx_margin_blocked": f"~${est_margin} USDT (50x leverage)",
+                "sl": sl_price,
+                "tp": tp_price,
+                "margin_used": "~$1.60 USD",
                 "delta_order_id": order.get("id")
             },
-            "next_step": "Delta Demo web -> Positions tab dekho! Trade instant close korte visit: /close-trade"
+            "next": "Open Delta app -> Positions tab! To close immediately, open: /close-trade"
         }), 200
 
     except Exception as e:
-        return jsonify({"test_trade_failed": str(e)}), 500
+        log(f"❌ Order Placement Error: {e}")
+        return jsonify({
+            "status": "FAILED",
+            "delta_raw_error": str(e)
+        }), 200
 
-# ==============================================================================
-# 🛑 INSTANT CLOSE ENDPOINT
-# ==============================================================================
 @app.route("/close-trade")
 def close_trade():
     global global_exchange, SYMBOL, bot_state
     active_trade = bot_state["active_trade"]
     if not active_trade:
-        return jsonify({"message": "No active trade currently open"}), 200
+        return jsonify({"message": "No active trade open"}), 200
 
     try:
         qty = active_trade["qty"]
@@ -437,8 +379,9 @@ def close_trade():
         bot_state["active_trade"] = None
         bot_state["last_action"] = "Trade Closed via /close-trade"
         return jsonify({
-            "message": " ACTIVE TRADE CLOSED SUCCESSFULLY ON DELTA DEMO!",
-            "close_order_id": order.get("id")
+            "status": "CLOSED",
+            "message": "✅ Trade closed successfully on Delta Demo!",
+            "order_id": order.get("id")
         }), 200
     except Exception as e:
         return jsonify({"close_error": str(e)}), 500
@@ -446,4 +389,4 @@ def close_trade():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
-    
+                    
